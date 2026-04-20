@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Date, Boolean, DateTime, ForeignKey
 from .database import Base
 from datetime import datetime
 
@@ -148,6 +148,7 @@ class Order(Base):
     order_type = Column(String, default="food")          # "food" | "bar"
     status     = Column(String, default="pending")       # pending | confirmed | delivered | cancelled
     ordered_at = Column(DateTime, default=datetime.now)
+    group_id = Column(Integer, ForeignKey("group_bookings.id"), nullable=True)
 
 
 class SpaBooking(Base):
@@ -166,7 +167,7 @@ class SpaBooking(Base):
     price      = Column(Integer, default=0)             # e.g. "09:00 AM – 10:00 AM"
     status     = Column(String, default="pending")       # pending | confirmed | completed | cancelled
     booked_at  = Column(DateTime, default=datetime.now)
-
+    group_id = Column(Integer, ForeignKey("group_bookings.id"), nullable=True)
 
 class EntertainmentBooking(Base):
     """
@@ -186,7 +187,7 @@ class EntertainmentBooking(Base):
     price      = Column(Integer, default=0)              # total price (price_per_person × guests)
     status     = Column(String, default="pending")
     booked_at  = Column(DateTime, default=datetime.now)
-
+    group_id = Column(Integer, ForeignKey("group_bookings.id"), nullable=True)
 
 class ActivityBooking(Base):
     """
@@ -202,7 +203,7 @@ class ActivityBooking(Base):
     time_slot   = Column(String, nullable=True)
     status      = Column(String, default="pending")
     booked_at   = Column(DateTime, default=datetime.now)
-
+    group_id = Column(Integer, ForeignKey("group_bookings.id"), nullable=True)
 
 class DineBooking(Base):
     """
@@ -219,6 +220,7 @@ class DineBooking(Base):
     slot       = Column(String, nullable=False)
     status     = Column(String, default="pending")
     booked_at  = Column(DateTime, default=datetime.now)
+    group_id = Column(Integer, ForeignKey("group_bookings.id"), nullable=True)
 
 class RoomServiceItem(Base):
     __tablename__ = "room_service_items"
@@ -253,8 +255,9 @@ class GroupBooking(Base):
     id              = Column(Integer, primary_key=True)
     group_name      = Column(String(150))
     welcome_message = Column(String(300))
-    room_numbers    = Column(Integer)
+    room_numbers    = Column(String)
     check_in        = Column(String(20))
     check_out       = Column(String(20))
     is_active       = Column(Integer)
     created_at      = Column(String(30))
+    meal_plan       = Column(String(20), nullable=True)

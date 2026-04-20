@@ -20,8 +20,8 @@ from .models import Template, Service, FoodItem, SpaItem, BarItem, DineItem, Ent
 from .booking_routes import router as booking_router   # NEW: booking/order endpoints
 import httpx 
 from .models import GroupBooking  
-from fastapi.responses import JSONResponse    
-from .models import GroupBooking                                     # NEW: used by booking_routes for PMS sync
+from fastapi.responses import JSONResponse 
+from app.dashboard import router as dashboard_router
 
 
 models.Base.metadata.create_all(bind=engine)
@@ -33,8 +33,6 @@ with engine.connect() as _conn:
         "ALTER TABLE orders ADD COLUMN order_type VARCHAR(20) DEFAULT 'food'",
         "ALTER TABLE spa_bookings ADD COLUMN price INT DEFAULT 0",
         "ALTER TABLE guests ADD COLUMN meal_plan VARCHAR(10) DEFAULT NULL",
-        # FIX 1: auto-migrate missing room_numbers column on group_bookings
-        "ALTER TABLE group_bookings ADD COLUMN room_numbers TEXT DEFAULT '[]'",
     ]:
         try:
             _conn.execute(text(_sql))
@@ -45,6 +43,9 @@ with engine.connect() as _conn:
 
 app = FastAPI()
 app.include_router(booking_router)   # NEW: registers all /api/order, /api/spa-booking etc.
+
+app.include_router(dashboard_router)                                        # NEW: used by booking_routes for PMS sync
+
 
 templates = Jinja2Templates(directory="templates")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -518,6 +519,7 @@ def get_current_theme():
     if theme:
         return {"template": theme[0]}
 
+
     return {"template": "default.html"}
 
 
@@ -578,16 +580,20 @@ def discard_theme(theme_id: int):
 
 @app.get("/api/room-data/{room_no}")
 async def get_room_data(room_no: int):
+    custom_message = room_messages.get(room_no, "Have a beautiful stay.")
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             response = await client.get(
                 f"http://localhost:8000/pms/room-info/{room_no}"
             )
             data = response.json()
-            return {"name": data.get("name", "Guest")}
+            return {
+                "name": data.get("name", "Guest"),
+                "message": custom_message
+            }
     except Exception as e:
         print("ERROR:", e)
-        return {"name": "Guest"}
+        return {"name": "Guest", "message": custom_message}  # ← always use room_messages
 
 
 # =========================
@@ -608,8 +614,8 @@ def activities_page(request: Request):
 @app.post("/admin/activities/add")
 def add_activity(
     title: str = Form(...),
-    start_time: str = Form(""),
-    end_time: str = Form(""),
+    slot1: str = Form(""),
+    slot1_end: str = Form(""),
     is_announcement: str = Form("off")
 ):
     db = SessionLocal()
@@ -625,8 +631,8 @@ def add_activity(
 
     is_ann = (is_announcement == "on")
     time_slot = None
-    if not is_ann and start_time and end_time:
-        time_slot = f"{to12hr(start_time)} - {to12hr(end_time)}"
+    if not is_ann and slot1 and slot1_end:
+        time_slot = f"{slot1} - {slot1_end}"
 
     activity = models.Activity(
         title=title,
@@ -1850,17 +1856,14 @@ def api_gallery_items():
         for i in items
     ]
 
-
-# =========================
-# GUESTS PAGE (ADMIN)
-# =========================
+from datetime import date
 
 @app.get("/admin/guests", response_class=HTMLResponse)
 def guest_info(request: Request):
     db = SessionLocal()
     today = date.today()
     all_guests = db.query(models.Guest).all()
-
+    
     current_guests = []
     checked_out_guests = []
     upcoming_guests = []
@@ -1887,7 +1890,6 @@ def guest_info(request: Request):
         "checked_out_guests": checked_out_guests,
         "upcoming_guests": upcoming_guests,
     })
-
 
 # =========================
 # DELETE GUEST BY ROOM (REST-style)
@@ -1941,7 +1943,6 @@ def delete_guest_by_id(room_no: int):
 # =========================
 # DELETE GUEST (POST /delete-guest)
 # Called by the frontend deleteGuest() JS function
-# FIX 2: This is the canonical delete-guest handler — removed duplicate from booking_routes.py
 # =========================
 
 @app.post("/delete-guest")
@@ -2027,16 +2028,11 @@ async def delete_guest_post(request: Request):
     finally:
         db.close()
 
-
-# =========================
-# GROUP BOOKINGS (ADMIN)
-# =========================
-
 @app.get("/admin/groups", response_class=HTMLResponse)
 def admin_group_bookings(request: Request):
     db = SessionLocal()
     today = date.today()
-    all_groups = db.query(GroupBooking).all()
+    all_groups = db.query(GroupBooking).all()  # ← fixed
 
     active_groups = []
     past_groups = []
@@ -2046,12 +2042,7 @@ def admin_group_bookings(request: Request):
         ci = g.check_in  if isinstance(g.check_in,  date) else date.fromisoformat(str(g.check_in))
         co = g.check_out if isinstance(g.check_out, date) else date.fromisoformat(str(g.check_out))
 
-        # FIX 3: guard against None room_numbers before json.loads
-        g.room_numbers_list = (
-            json.loads(g.room_numbers)
-            if g.room_numbers and isinstance(g.room_numbers, str)
-            else (g.room_numbers or [])
-        )
+        g.room_numbers_list = json.loads(g.room_numbers) if isinstance(g.room_numbers, str) else g.room_numbers
 
         if ci <= today <= co:
             g.days_left = (co - today).days
@@ -2073,58 +2064,47 @@ def admin_group_bookings(request: Request):
     })
 
 
-@app.get("/admin/groups", response_class=HTMLResponse)
-def groups_page(request: Request):
+# =========================
+# SEND GROUP MESSAGE
+# =========================
+
+@app.post("/send-group-message")
+def send_group_message(
+    group_id: int = Form(...),
+    room_numbers: str = Form(...),
+    message: str = Form(...)
+):
+    # Send message to all rooms in the group
+    rooms = [r.strip() for r in room_numbers.split(',')]
+    for room in rooms:
+        try:
+            room_messages[int(room)] = message
+            print(f"✅ Group message set: room={room}, msg={message}")
+        except:
+            pass
+    return RedirectResponse("/admin/groups", status_code=303)
+
+@app.get("/api/guests/current")
+def api_current_guests():
     db = SessionLocal()
     today = date.today()
+    all_guests = db.query(models.Guest).all()
 
-    try:
-        groups = db.query(GroupBooking).all()
-    except Exception as e:
-        print("DB ERROR:", e)
-        groups = []
-
-    active_groups = []
-    past_groups = []
-    upcoming_groups = []
-
-    for g in groups:
-        try:
-            g.room_numbers_list = json.loads(g.room_numbers or "[]")
-        except:
-            g.room_numbers_list = []
-
-        try:
-            g.days_left = (g.check_out - today).days if g.check_out else 0
-        except:
-            g.days_left = 0
-
-        if g.check_in and g.check_out:
-            if g.check_in <= today <= g.check_out:
-                active_groups.append(g)
-            elif g.check_out < today:
-                past_groups.append(g)
-            else:
-                upcoming_groups.append(g)
+    current_guests = []
+    for g in all_guests:
+        ci = g.check_in  if isinstance(g.check_in,  date) else date.fromisoformat(str(g.check_in))
+        co = g.check_out if isinstance(g.check_out, date) else date.fromisoformat(str(g.check_out))
+        if ci <= today <= co:
+            days_left = (co - today).days
+            current_guests.append({
+                "room_no":    g.room_no,
+                "guest_name": g.guest_name,
+                "check_in":   str(g.check_in),
+                "check_out":  str(g.check_out),
+                "days_left":  days_left
+            })
 
     db.close()
+    return current_guests
 
-    print("ACTIVE:", active_groups)
-    print("PAST:", past_groups)
-    print("UPCOMING:", upcoming_groups)
-
-
-
-    return templates.TemplateResponse(
-        "dashboard.html",
-        {
-            "request": request,
-            "page": "groups",
-            "active_groups": active_groups or [],
-            "past_groups": past_groups or [],
-            "upcoming_groups": upcoming_groups or []
-        }
-    )
     
-
-    ()

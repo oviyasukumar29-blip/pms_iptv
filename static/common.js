@@ -27,35 +27,45 @@
     window.ROOM_NO = roomNo
 
     async function loadRoomData() {
-        const guestEl   = document.getElementById('guestName')
-        const roomEl    = document.getElementById('roomNo')
-        const messageEl = document.getElementById('customMessage')
+    const guestEl   = document.getElementById('guestName')
+    const roomEl    = document.getElementById('roomNo')
+    const messageEl = document.getElementById('customMessage')
 
-        if (!guestEl && !roomEl && !messageEl) return
+    if (!guestEl && !roomEl && !messageEl) return
 
-        try {
-            const data = await fetch(`/api/room-data/${roomNo}`).then(r => r.json())
+    try {
+        const data = await fetch(`/api/room-data/${roomNo}?t=${Date.now()}`, {
+            cache: 'no-store',
+            headers: { 'Cache-Control': 'no-cache, no-store, must-revalidate', 'Pragma': 'no-cache' }
+        }).then(r => r.json())
 
-            console.log("API DATA:", data) // 🔍 DEBUG
-
-            // ✅ FIXED
-            if (guestEl)
-                guestEl.innerHTML = 'Welcome, <em>' + data.name + '</em>'
-
-            if (roomEl)
-                roomEl.textContent = 'Room ' + roomNo
-
-            // ✅ OPTIONAL (static message)
-            if (messageEl)
-                messageEl.textContent = "Have a nice stay"
-
-        } catch (e) {
-            console.error("Error loading room data:", e)
+        /* ── Diff-only writes: only touch the DOM if the value changed ── */
+        if (guestEl) {
+            const newHTML = 'Welcome, <em>' + data.name + '</em>'
+            if (guestEl.innerHTML !== newHTML)
+                guestEl.innerHTML = newHTML
         }
+
+        if (roomEl) {
+            const newRoom = 'Room ' + roomNo
+            if (roomEl.textContent !== newRoom)
+                roomEl.textContent = newRoom
+        }
+
+        if (messageEl) {
+            const newMsg = data.message || 'Have a nice stay'
+            if (messageEl.textContent !== newMsg)
+                messageEl.textContent = newMsg
+        }
+
+    } catch (e) {
+        console.error("Error loading room data:", e)
     }
+}
 
     window.onload = () => {
-        loadRoomData()
+    loadRoomData()
+    setInterval(loadRoomData, 30000) // poll every 5 seconds
     }
 
 
@@ -1413,10 +1423,17 @@
     let _myOrdersPollTimer = null
 
     window.openMyOrders = function () {
-        const overlay = document.getElementById('myOrdersOverlay')
+        const overlay   = document.getElementById('myOrdersOverlay')
+        const container = document.getElementById('myOrdersContent')
         if (!overlay) return
         overlay.classList.add('active')
         document.body.style.overflow = 'hidden'
+
+        /* Show placeholder ONLY on first open when container is empty */
+        if (container && !container.innerHTML.trim()) {
+            container.innerHTML = '<p style="color:rgba(248,243,236,.3);text-align:center;padding:40px 0;font-style:italic;">Loading your bookings…</p>'
+        }
+
         loadMyOrders()
         clearInterval(_myOrdersPollTimer)
         _myOrdersPollTimer = setInterval(loadMyOrders, 15000)
@@ -1432,14 +1449,23 @@
 
     async function loadMyOrders() {
         if (!window.ROOM_NO) return
+        const overlay   = document.getElementById('myOrdersOverlay')
         const container = document.getElementById('myOrdersContent')
         if (!container) return
-        container.innerHTML = '<p style="color:rgba(248,243,236,.3);text-align:center;padding:40px 0;font-style:italic;">Loading your bookings…</p>'
+
+        /* Silent background poll — skip entirely if overlay is not visible */
+        const overlayOpen = overlay && overlay.classList.contains('active')
+        if (!overlayOpen) return
+
+        /* NO "Loading…" flash — fetch silently in background, swap once done */
         try {
             const data = await fetch('/api/my-orders/' + window.ROOM_NO).then(r => r.json())
-            container.innerHTML = _renderMyOrders(data)
+            /* Re-check overlay is still open after async fetch completes */
+            if (overlay && overlay.classList.contains('active')) {
+                container.innerHTML = _renderMyOrders(data)
+            }
         } catch (e) {
-            container.innerHTML = '<p style="color:rgba(248,243,236,.3);padding:20px;text-align:center;">Unable to load bookings right now.</p>'
+            /* Silent fail on background poll — don't flash an error either */
         }
     }
 
@@ -1504,9 +1530,8 @@
             return originalStatus
         }
         
-        // Default cancellation window: 24 hours = 86400000 ms
-        // (previous code used 600000 = 10 minutes for some reason, can be overridden)
-        const window = cancellationWindowMs || 86400000
+        // Default cancellation window: 10 minutes = 600000 ms (must match backend)
+        const window = cancellationWindowMs || 600000
         const now = Date.now()
         const cancelDeadline = bookedEpoch + window
         
@@ -1514,129 +1539,166 @@
         return (now > cancelDeadline) ? 'confirmed' : 'pending'
     }
 
+    function _renderMyOrders(data) {
+        const { totals, orders, spa_bookings, entertainment_bookings, activity_bookings, dine_bookings, meal_plan } = data
+        let html = ''
+        html += '<div style="background:rgba(212,168,67,.08);border:.5px solid rgba(212,168,67,.2);border-radius:14px;padding:18px 24px;margin-bottom:24px;display:flex;justify-content:space-between;align-items:center;">'
+        html += '<div><div style="font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:rgba(212,168,67,.6);margin-bottom:4px;">Total Charges So Far</div>'
 
-function _renderMyOrders(data) {
-    const { totals, orders, spa_bookings, entertainment_bookings, activity_bookings, dine_bookings, meal_plan } = data
-    let html = ''
+        // Recalculate totals on the frontend using _getActualStatus so that
+        // orders auto-confirmed after 10 mins are included in the grand total
+        // rather than relying on server totals which still see them as "pending".
+        const WIN = 600000 // 10 minutes — must match _getActualStatus calls below
 
-    // ───────────────── TOTAL CHARGES ─────────────────
-    html += '<div style="background:rgba(212,168,67,.08);border:.5px solid rgba(212,168,67,.2);border-radius:14px;padding:18px 24px;margin-bottom:24px;display:flex;justify-content:space-between;align-items:center;">'
+        const calcFood = (orders||[])
+            .filter(o => o.type === 'food' && o.status !== 'cancelled'
+                      && _getActualStatus(o.status, o.booked_epoch || 0, WIN) === 'confirmed')
+            .reduce((s, o) => s + (Number(o.total) || 0), 0)
 
-    html += '<div><div style="font-size:11px;letter-spacing:.3em;text-transform:uppercase;color:rgba(212,168,67,.6);margin-bottom:4px;">Total Charges So Far</div>'
+        const calcBar = (orders||[])
+            .filter(o => o.type === 'bar' && o.status !== 'cancelled'
+                      && _getActualStatus(o.status, o.booked_epoch || 0, WIN) === 'confirmed')
+            .reduce((s, o) => s + (Number(o.total) || 0), 0)
 
-    const calcSpa   = (spa_bookings || []).reduce((s, b) => s + (Number(b.price) || 0), 0)
-    const calcDine  = (dine_bookings || []).reduce((s, b) => s + (Number(b.price) || 0), 0)
-    const calcEnt   = (entertainment_bookings || []).reduce((s, b) => s + (Number(b.price) || 0), 0)
-    const calcFood  = totals.food || 0
-    const calcBar   = totals.bar || 0
-    const calcGrand = calcFood + calcBar + calcSpa + calcDine + calcEnt
+        const calcSpa = (spa_bookings||[])
+            .filter(b => b.status !== 'cancelled'
+                      && _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'confirmed')
+            .reduce((s, b) => s + (Number(b.price) || 0), 0)
 
-    html += '<div style="font-size:12px;color:rgba(248,243,236,.4);">Food ₹' + calcFood + ' · Bar ₹' + calcBar + ' · Spa ₹' + calcSpa + ' · Entertainment ₹' + calcEnt + '</div></div>'
-    html += '<div style="font-family:\'Cormorant Garamond\',serif;font-size:36px;font-weight:300;color:var(--gold-light);">₹' + calcGrand.toLocaleString('en-IN') + '</div></div>'
+        const calcEnt = (entertainment_bookings||[])
+            .filter(b => b.status !== 'cancelled'
+                      && _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'confirmed')
+            .reduce((s, b) => s + (Number(b.price) || 0), 0)
 
-    // ───────────────── MEAL PLAN BOX ─────────────────
-    const MEAL_LABELS = {
-        'AI': '🍽️ All Inclusive',
-        'AP': '🍳 Full Board',
-        'MAP': '🥗 Half Board',
-        'CP': '☕ Breakfast Only',
-        'EP': '🛏️ Room Only',
+        const calcDine = (dine_bookings||[])
+            .filter(b => b.status !== 'cancelled'
+                      && _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'confirmed')
+            .reduce((s, b) => s + (Number(b.price) || 0), 0)
+
+        const calcGrand = calcFood + calcBar + calcSpa + calcEnt + calcDine
+
+        html += '<div style="font-size:12px;color:rgba(248,243,236,.4);">Food ₹' + calcFood + ' · Bar ₹' + calcBar + ' · Spa ₹' + calcSpa + ' · Ent ₹' + calcEnt + ' · Dining ₹' + calcDine + '</div>'
+
+        // Pending = items whose status is still genuinely pending (within 10-min window)
+        const pendingFood = (orders||[]).filter(o => o.type === 'food' && _getActualStatus(o.status, o.booked_epoch || 0, WIN) === 'pending').reduce((s,o)=>s+(Number(o.total)||0),0)
+        const pendingSpa  = (spa_bookings||[]).filter(b => _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'pending').reduce((s,b)=>s+(Number(b.price)||0),0)
+        const pendingEnt  = (entertainment_bookings||[]).filter(b => _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'pending').reduce((s,b)=>s+(Number(b.price)||0),0)
+        const pendingDine = (dine_bookings||[]).filter(b => _getActualStatus(b.status, b.booked_epoch || 0, WIN) === 'pending').reduce((s,b)=>s+(Number(b.price)||0),0)
+        const pendingTotal = pendingFood + pendingSpa + pendingEnt + pendingDine
+        if (pendingTotal > 0) html += '<div style="font-size:11px;color:rgba(212,168,67,.5);margin-top:4px;">+ \u20b9' + pendingTotal.toLocaleString('en-IN') + ' pending admin confirmation</div>'
+        html += '</div>'
+        html += '<div style="font-family:\'Cormorant Garamond\',serif;font-size:36px;font-weight:300;color:var(--gold-light);">₹' + calcGrand.toLocaleString('en-IN') + '</div></div>'
+
+        // ── Meal Plan Box ─────────────────────────────────────────────────────
+        const MEAL_LABELS = {
+            'AI':  '🍽️ All Inclusive',
+            'AP':  '🍳 Full Board',
+            'MAP': '🥗 Half Board',
+            'CP':  '☕ Breakfast Only',
+            'EP':  '🛏️ Room Only',
+        }
+        html += '<div style="background:rgba(255,255,255,.05);border:.5px solid rgba(192,24,90,.2);border-radius:14px;padding:16px 22px;margin-bottom:22px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">'
+        html += '<div><div style="font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:rgba(212,168,67,.6);margin-bottom:5px;">Meal Plan</div>'
+        html += '<div style="font-size:18px;font-weight:500;color:var(--cream);">' + (MEAL_LABELS[meal_plan] || '—') + '</div></div>'
+        html += '<select onchange="changeMealPlan(this.value)" style="background:rgba(255,255,255,.08);border:.5px solid rgba(192,24,90,.4);color:var(--gold-light);border-radius:10px;padding:8px 14px;font-family:\'Jost\',sans-serif;font-size:13px;outline:none;cursor:pointer;">'
+        html += '<option value="">Change plan…</option>'
+        html += '<option value="AI"'  + (meal_plan === 'AI'  ? ' selected' : '') + '>All Inclusive (AI)</option>'
+        html += '<option value="AP"'  + (meal_plan === 'AP'  ? ' selected' : '') + '>Full Board (AP)</option>'
+        html += '<option value="MAP"' + (meal_plan === 'MAP' ? ' selected' : '') + '>Half Board (MAP)</option>'
+        html += '<option value="CP"'  + (meal_plan === 'CP'  ? ' selected' : '') + '>Breakfast Only (CP)</option>'
+        html += '<option value="EP"'  + (meal_plan === 'EP'  ? ' selected' : '') + '>Room Only (EP)</option>'
+        html += '</select></div>'
+        // ─────────────────────────────────────────────────────────────────────
+
+        const noContent = !orders.length && !spa_bookings.length && !entertainment_bookings.length && !activity_bookings.length && !dine_bookings.length
+        if (noContent) {
+            html += '<p style="color:rgba(248,243,236,.25);text-align:center;padding:40px 0;font-style:italic;font-size:15px;">No bookings yet.<br>Explore our services to get started.</p>'
+            return html
+        }
+
+        function section(title) {
+            return '<div style="font-size:10px;letter-spacing:.4em;text-transform:uppercase;color:var(--gold);margin:22px 0 10px;display:flex;align-items:center;gap:10px;">' + title + '<span style="flex:1;height:.5px;background:linear-gradient(90deg,rgba(212,168,67,.3),transparent);"></span></div>'
+        }
+
+        function card(left, right, meta, cancelType, cancelId, bookedEpoch) {
+            const now          = Date.now()
+            const withinWindow = bookedEpoch && (now - bookedEpoch) < 600000
+            const cancelBtn    = (cancelType && cancelId && withinWindow)
+                ? `<button onclick="guestCancel('${cancelType}',${cancelId},this)"
+                       style="margin-top:8px;padding:4px 14px;border-radius:20px;font-size:11px;font-weight:600;
+                              background:rgba(231,76,60,.12);color:#e74c3c;border:.5px solid rgba(231,76,60,.4);
+                              cursor:pointer;letter-spacing:.04em;">❌ Cancel</button>`
+                : (cancelType && cancelId && !withinWindow && right.includes('pending'))
+                ? `<span style="font-size:10px;color:rgba(248,243,236,.25);margin-top:6px;display:block;">Cancel window expired</span>`
+                : ''
+            return '<div style="background:rgba(20,4,12,0.72);border:.5px solid rgba(192,24,90,.15);border-radius:12px;padding:14px 18px;margin-bottom:10px;">'
+                + '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">'
+                + '<span style="font-size:14px;color:var(--cream);font-weight:500;">' + left + '</span>' + right
+                + '</div>'
+                + '<div style="font-size:11px;color:rgba(248,243,236,.35);">' + meta + '</div>'
+                + cancelBtn
+                + '</div>'
+        }
+
+        const foodOrders = (orders||[]).filter(o => o.type === 'food' && o.status !== 'cancelled')
+        if (foodOrders.length) {
+            html += section('Room Service')
+            foodOrders.forEach(o => {
+                let items = []
+                try { items = JSON.parse(o.items.replace(/'/g, '"')) } catch(e) {}
+                const label = items.length ? items.map(i => i.name + ' x' + i.qty).join(', ') : 'Order #' + o.id
+                const actualStatus = _getActualStatus(o.status, o.booked_epoch || 0, WIN)
+                html += card(label, _moStatusBadge(actualStatus), '₹' + o.total + ' · ' + o.ordered_at, 'order', o.id, o.booked_epoch || 0)
+            })
+        }
+        const barOrders = (orders||[]).filter(o => o.type === 'bar' && o.status !== 'cancelled')
+        if (barOrders.length) {
+            html += section('Bar Orders')
+            barOrders.forEach(o => {
+                let items = []
+                try { items = JSON.parse(o.items.replace(/'/g, '"')) } catch(e) {}
+                const label = items.length ? items.map(i => i.name + ' x' + i.qty).join(', ') : 'Bar Order #' + o.id
+                const actualStatus = _getActualStatus(o.status, o.booked_epoch || 0, WIN)
+                html += card(label, _moStatusBadge(actualStatus), '₹' + o.total + ' · ' + o.ordered_at, 'order', o.id, o.booked_epoch || 0)
+            })
+        }
+        const visibleSpa = (spa_bookings||[]).filter(b => b.status !== 'cancelled')
+        if (visibleSpa.length) {
+            html += section('Spa & Wellness')
+            visibleSpa.forEach(b => {
+                const priceStr = b.price && b.price > 0 ? ' · ₹' + b.price : ''
+                const actualStatus = _getActualStatus(b.status, b.booked_epoch || 0, WIN)
+                html += card(b.title, _moStatusBadge(actualStatus), b.slot + priceStr + ' · ' + b.booked_at, 'spa', b.id, b.booked_epoch || 0)
+            })
+        }
+        const visibleEnt = (entertainment_bookings||[]).filter(b => b.status !== 'cancelled')
+        if (visibleEnt.length) {
+            html += section('Entertainment')
+            visibleEnt.forEach(b => {
+                const meta = [b.slot, b.venue, b.price ? '₹' + b.price : null, b.booked_at].filter(Boolean).join(' · ')
+                const actualStatus = _getActualStatus(b.status, b.booked_epoch || 0, WIN)
+                html += card(b.title + (b.guests > 1 ? ' x' + b.guests : ''), _moStatusBadge(actualStatus), meta, 'entertainment', b.id, b.booked_epoch || 0)
+            })
+        }
+        const visibleAct = (activity_bookings||[]).filter(b => b.status !== 'cancelled')
+        if (visibleAct.length) {
+            html += section('Activity Reservations')
+            visibleAct.forEach(b => {
+                const actualStatus = _getActualStatus(b.status, b.booked_epoch || 0, WIN)
+                html += card(b.title, _moStatusBadge(actualStatus), [b.time_slot, b.booked_at].filter(Boolean).join(' · '), 'activity', b.id, b.booked_epoch || 0)
+            })
+        }
+        const visibleDine = (dine_bookings||[]).filter(b => b.status !== 'cancelled')
+        if (visibleDine.length) {
+            html += section('Dining Reservations')
+            visibleDine.forEach(b => {
+                const actualStatus = _getActualStatus(b.status, b.booked_epoch || 0, WIN)
+                html += card(b.title, _moStatusBadge(actualStatus), b.slot + ' · ' + b.booked_at, 'dine', b.id, b.booked_epoch || 0)
+            })
+        }
+
+        return html  // BUG FIX: missing return statement — function never returned html
     }
-
-    html += '<div style="background:rgba(255,255,255,.05);border:.5px solid rgba(192,24,90,.2);border-radius:14px;padding:16px 22px;margin-bottom:22px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;">'
-    html += '<div><div style="font-size:10px;letter-spacing:.35em;text-transform:uppercase;color:rgba(212,168,67,.6);margin-bottom:5px;">Meal Plan</div>'
-    html += '<div style="font-size:18px;font-weight:500;color:var(--cream);">' + (MEAL_LABELS[meal_plan] || '—') + '</div></div>'
-
-    html += '<select onchange="changeMealPlan(this.value)" style="background:rgba(255,255,255,.08);border:.5px solid rgba(192,24,90,.4);color:var(--gold-light);border-radius:10px;padding:8px 14px;font-family:\'Jost\',sans-serif;font-size:13px;outline:none;cursor:pointer;">'
-    html += '<option value="">Change plan…</option>'
-    html += '<option value="AI"' + (meal_plan === 'AI' ? ' selected' : '') + '>All Inclusive (AI)</option>'
-    html += '<option value="AP"' + (meal_plan === 'AP' ? ' selected' : '') + '>Full Board (AP)</option>'
-    html += '<option value="MAP"' + (meal_plan === 'MAP' ? ' selected' : '') + '>Half Board (MAP)</option>'
-    html += '<option value="CP"' + (meal_plan === 'CP' ? ' selected' : '') + '>Breakfast Only (CP)</option>'
-    html += '<option value="EP"' + (meal_plan === 'EP' ? ' selected' : '') + '>Room Only (EP)</option>'
-    html += '</select></div>'
-
-    // ───────────────── EMPTY CHECK ─────────────────
-    const noContent = !orders.length && !spa_bookings.length && !entertainment_bookings.length && !activity_bookings.length && !dine_bookings.length
-
-    if (noContent) {
-        html += '<p style="color:rgba(248,243,236,.25);text-align:center;padding:40px 0;font-style:italic;font-size:15px;">No bookings yet.<br>Explore our services to get started.</p>'
-        return html
-    }
-
-    // ───────────────── HELPERS ─────────────────
-    function section(title) {
-        return '<div style="font-size:10px;letter-spacing:.4em;text-transform:uppercase;color:var(--gold);margin:22px 0 10px;display:flex;align-items:center;gap:10px;">' + title + '<span style="flex:1;height:.5px;background:linear-gradient(90deg,rgba(212,168,67,.3),transparent);"></span></div>'
-    }
-
-    function card(left, right, meta) {
-        return '<div style="background:rgba(20,4,12,0.72);border:.5px solid rgba(192,24,90,.15);border-radius:12px;padding:14px 18px;margin-bottom:10px;"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;"><span style="font-size:14px;color:var(--cream);font-weight:500;">' + left + '</span>' + right + '</div><div style="font-size:11px;color:rgba(248,243,236,.35);">' + meta + '</div></div>'
-    }
-
-    // ───────────────── ROOM SERVICE ─────────────────
-    const foodOrders = orders.filter(o => o.type === 'food' && o.status !== 'cancelled')
-    if (foodOrders.length) {
-        html += section('Room Service')
-        foodOrders.forEach(o => {
-            let items = []
-            try { items = JSON.parse(o.items.replace(/'/g, '"')) } catch (e) {}
-            const label = items.length ? items.map(i => i.name + ' x' + i.qty).join(', ') : 'Order #' + o.id
-            html += card(label, _moStatusBadge(o.status), '₹' + o.total + ' · ' + o.ordered_at)
-        })
-    }
-
-    // ───────────────── BAR ─────────────────
-    const barOrders = orders.filter(o => o.type === 'bar' && o.status !== 'cancelled')
-    if (barOrders.length) {
-        html += section('Bar Orders')
-        barOrders.forEach(o => {
-            let items = []
-            try { items = JSON.parse(o.items.replace(/'/g, '"')) } catch (e) {}
-            const label = items.length ? items.map(i => i.name + ' x' + i.qty).join(', ') : 'Bar Order #' + o.id
-            html += card(label, _moStatusBadge(o.status), '₹' + o.total + ' · ' + o.ordered_at)
-        })
-    }
-
-    // ───────────────── SPA ─────────────────
-    if (spa_bookings.length) {
-        html += section('Spa & Wellness')
-        spa_bookings.forEach(b => {
-            const priceStr = b.price && b.price > 0 ? ' · ₹' + b.price : ''
-            html += card(b.title, _moStatusBadge(b.status), b.slot + priceStr + ' · ' + b.booked_at)
-        })
-    }
-
-    // ───────────────── ENTERTAINMENT ─────────────────
-    if (entertainment_bookings.length) {
-        html += section('Entertainment')
-        entertainment_bookings.forEach(b => {
-            const meta = [b.slot, b.venue, b.price ? '₹' + b.price : null, b.booked_at].filter(Boolean).join(' · ')
-            html += card(b.title + (b.guests > 1 ? ' x' + b.guests : ''), _moStatusBadge(b.status), meta)
-        })
-    }
-
-    // ───────────────── ACTIVITIES ─────────────────
-    if (activity_bookings.length) {
-        html += section('Activity Reservations')
-        activity_bookings.forEach(b => {
-            html += card(b.title, _moStatusBadge(b.status), [b.time_slot, b.booked_at].filter(Boolean).join(' · '))
-        })
-    }
-
-    // ───────────────── DINING ─────────────────
-    if (dine_bookings.length) {
-        html += section('Dining Reservations')
-        dine_bookings.forEach(b => {
-            html += card(b.title, _moStatusBadge(b.status), b.slot + ' · ' + b.booked_at)
-        })
-    }
-
-    return html
-}
-
-
-
-
 
 
     /* ═══════════════════════════════════════════════════════════════
@@ -1847,8 +1909,10 @@ function _renderMyOrders(data) {
         loadServices()
         setInterval(loadServices, 30000)
 
-        loadMyOrders()
-        setInterval(loadMyOrders, 30000)
+        /* loadMyOrders polling is handled entirely by openMyOrders/closeMyOrders.
+           Do NOT call loadMyOrders() here or set a global interval — the function
+           checks overlay visibility anyway, but the old unguarded interval was the
+           source of the visible "Loading your bookings…" flash every 30 s. */
 
         // Gallery lightbox — close on background click or Escape key
         const lb = document.getElementById('galleryLightbox')
@@ -1866,6 +1930,169 @@ function _renderMyOrders(data) {
         document.addEventListener('DOMContentLoaded', init)
     } else {
         init()
+    }
+
+    /* ═══════════════════════════════════════════════════════════════
+       ADMIN — ACTIVITIES (timepicker + toggleTimeSlot + deleteActivity)
+       Fixes double AM/PM bug: strips any existing meridiem from the
+       start-time string before arithmetic, then appends it once.
+    ═══════════════════════════════════════════════════════════════ */
+
+    /**
+     * Parse a time string that may or may not contain AM/PM.
+     * Returns { totalMinutes, h24 } so we can do arithmetic cleanly.
+     */
+    function _parseTime(str) {
+        if (!str) return null
+        // Normalise: remove extra spaces, upper-case
+        str = str.trim().toUpperCase()
+
+        // Detect and strip meridiem
+        let meridiem = null
+        if (str.endsWith('AM')) { meridiem = 'AM'; str = str.slice(0, -2).trim() }
+        else if (str.endsWith('PM')) { meridiem = 'PM'; str = str.slice(0, -2).trim() }
+
+        // Parse HH:MM or H:MM
+        const parts = str.split(':')
+        if (parts.length < 2) return null
+        let h = parseInt(parts[0], 10)
+        const m = parseInt(parts[1], 10)
+        if (isNaN(h) || isNaN(m)) return null
+
+        // Convert to 24-hour
+        if (meridiem === 'AM') {
+            if (h === 12) h = 0          // 12:xx AM → 00:xx
+        } else if (meridiem === 'PM') {
+            if (h !== 12) h += 12        // 1-11 PM → 13-23; 12 PM stays 12
+        }
+        // If no meridiem was present we treat the value as already 24-hour
+        return { totalMinutes: h * 60 + m }
+    }
+
+    /** Format total minutes (0-1439) as "hh:mm AM/PM" — meridiem appears exactly once. */
+    function _formatTime12(totalMinutes) {
+        // Wrap around midnight
+        totalMinutes = ((totalMinutes % 1440) + 1440) % 1440
+        const h24 = Math.floor(totalMinutes / 60)
+        const m   = totalMinutes % 60
+        const mer = h24 < 12 ? 'AM' : 'PM'
+        let h12   = h24 % 12
+        if (h12 === 0) h12 = 12
+        return String(h12).padStart(2, '0') + ':' + String(m).padStart(2, '0') + ' ' + mer
+    }
+
+    /** Show/hide the time-slot block when the Announcement checkbox is toggled. */
+    window.toggleTimeSlot = function () {
+        const chk   = document.getElementById('is_announcement_check')
+        const group = document.getElementById('timeslot-group')
+        if (!group) return
+        if (chk && chk.checked) {
+            group.style.display = 'none'
+        } else {
+            group.style.display = 'flex'
+        }
+    }
+
+    /** Delete an activity row and refresh the list. */
+    window.deleteActivity = async function (id) {
+        if (!confirm('Delete this activity?')) return
+        try {
+            await fetch('/admin/activities/delete/' + id, { method: 'POST' })
+            window.location.reload()
+        } catch (e) {
+            alert('Could not delete activity. Please try again.')
+        }
+    }
+
+    /* ── Activities admin: single-slot flatpickr ── */
+    document.addEventListener('DOMContentLoaded', function () {
+        const startEl    = document.querySelector('.act-slot-start[data-slot="1"]')
+        const durationEl = document.querySelector('.act-slot-duration[data-slot="1"]')
+        const endEl      = document.querySelector('.act-slot-end[data-slot="1"]')
+
+        if (!startEl || !durationEl || !endEl) return
+
+        // _actRecomputeEnd: called with the confirmed dateStr from flatpickr
+        // OR with no arg to re-read startEl.value (duration change case)
+        function _actRecomputeEnd(startStr) {
+            const str    = (startStr !== undefined) ? startStr : startEl.value
+            const parsed = _parseTime(str)
+            if (!parsed) { endEl.value = ''; return }
+            const duration = parseInt(durationEl.value, 10) || 60
+            endEl.value = _formatTime12(parsed.totalMinutes + duration)
+        }
+
+        // Initialise flatpickr — use dateStr arg so value is always finalised
+        if (typeof flatpickr !== 'undefined') {
+            flatpickr(startEl, {
+                enableTime:     true,
+                noCalendar:     true,
+                dateFormat:     'h:i K',       // e.g. "02:30 PM"
+                minuteIncrement: 15,
+                onChange: function (selectedDates, dateStr) {
+                    _actRecomputeEnd(dateStr)
+                }
+            })
+        } else {
+            // fallback: plain input event
+            startEl.addEventListener('change', function () { _actRecomputeEnd() })
+        }
+
+        durationEl.addEventListener('change', function () { _actRecomputeEnd() })
+
+        // On submit: validate Slot 1 has a start time, then write
+        // the combined "Start - End" string into the slot1 hidden field
+        const form = startEl.closest('form')
+        if (form) {
+            form.addEventListener('submit', function (e) {
+                const chk = document.getElementById('is_announcement_check')
+                if (chk && chk.checked) return   // announcements skip slots
+
+                const startVal = startEl.value.trim()
+                if (!startVal) {
+                    e.preventDefault()
+                    startEl.focus()
+                    alert('Please set a start time for Slot 1.')
+                    return
+                }
+
+                // Write "HH:MM AM - HH:MM PM" into the slot1 field
+                const slot1Input = form.querySelector('input[name="slot1"]')
+                if (slot1Input) {
+                    const endVal = endEl.value.trim()
+                    slot1Input.value = endVal ? startVal + ' - ' + endVal : startVal
+                }
+            })
+        }
+    })
+
+    /* ═══════════════════════════════════════════════════════════════
+       MEAL PLAN — guest can change their meal plan from My Orders
+       (from common1.js — new function not previously in common.js)
+    ═══════════════════════════════════════════════════════════════ */
+    window.changeMealPlan = async function (plan) {
+        if (!plan) return
+        try {
+            const res = await fetch('/api/update-meal-plan', {
+                method:  'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body:    JSON.stringify({ room_no: window.ROOM_NO, meal_plan: plan })
+            })
+            if (res.ok) {
+                const toast = document.getElementById('actToast')
+                if (toast) {
+                    toast.textContent = '✓ Meal plan updated!'
+                    toast.classList.add('show')
+                    setTimeout(() => {
+                        toast.classList.remove('show')
+                        toast.textContent = '✓ Reserved! See you at the activity 🎉'
+                    }, 3000)
+                }
+                loadMyOrders()
+            }
+        } catch (e) {
+            console.error('Meal plan update failed:', e)
+        }
     }
 
     window.guestCancel = async function(type, id, btn) {
@@ -1895,64 +2122,4 @@ function _renderMyOrders(data) {
     window.loadActivities = loadActivities
     window.loadRoomData   = loadRoomData
 
-
-
-    // ── My Orders overlay open / close ─────────────────────────
-    window.openMyOrders = function () {
-        const overlay = document.getElementById('myOrdersOverlay')
-        if (!overlay) return
-        overlay.classList.add('active')
-        document.body.style.overflow = 'hidden'
-        loadMyOrders()
-    }
-
-    window.closeMyOrders = function () {
-        const overlay = document.getElementById('myOrdersOverlay')
-        if (!overlay) return
-        overlay.classList.remove('active')
-        document.body.style.overflow = ''
-    }
-
-    async function loadMyOrders() {
-        const el = document.getElementById('myOrdersContent')
-        if (!el) return
-        try {
-            const data = await fetch('/api/my-orders/' + window.ROOM_NO).then(r => r.json())
-            el.innerHTML = _renderMyOrders(data)
-        } catch (e) {
-            el.innerHTML = '<p style="color:rgba(248,243,236,.3);text-align:center;padding:40px 0;font-style:italic;">Failed to load bookings.</p>'
-        }
-    }
-
-    window.changeMealPlan = async function(plan) {
-    if (!plan) return
-    try {
-        const res = await fetch('/api/update-meal-plan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                room_no: window.ROOM_NO,
-                meal_plan: plan
-            })
-        })
-
-        if (res.ok) {
-            const toast = document.getElementById('actToast')
-            if (toast) {
-                toast.textContent = '✓ Meal plan updated!'
-                toast.classList.add('show')
-                setTimeout(() => {
-                    toast.classList.remove('show')
-                    toast.textContent = '✓ Reserved! See you at the activity 🎉'
-                }, 3000)
-            }
-
-            loadMyOrders()
-        }
-    } catch (e) {
-        console.error('Meal plan update failed:', e)
-    }
-}
-}
-
-)()
+})()
